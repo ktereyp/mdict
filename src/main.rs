@@ -1,6 +1,7 @@
 extern crate core;
 
-use std::{fs, io};
+use std::{fs, io, process};
+use std::env::args;
 use std::fmt::{Debug, Display, Formatter};
 use std::mem::size_of;
 use std::io::{Read, Write, Seek, SeekFrom, Cursor, BufRead};
@@ -298,11 +299,13 @@ impl MdxFile {
                         let l = read_integer!(ByteOrder::BE, i16, reader) + 1;
                         let mut first_content: Vec<u8> = vec![0; l as usize];
                         reader.read_exact(&mut first_content).map_err(|e| e.to_string())?;
-                        Ok(String::from_utf8_lossy(&first_content).to_string())
+                        Ok(String::from_utf8_lossy(&first_content[..first_content.len() - 1]).to_string())
                     } else if encoding == Encoding::Utf16 {
                         let l = ((read_integer!(ByteOrder::BE, i16, reader) + 1) as usize) * 2;
                         let mut buff: Vec<u8> = vec![0; l];
                         reader.read_exact(&mut buff).map_err(|e| e.to_string())?;
+                        buff.pop();
+                        buff.pop();
                         let buff = unsafe {
                             std::slice::from_raw_parts_mut(buff.as_mut_ptr().cast::<u16>(), buff.len() / 2)
                         };
@@ -388,6 +391,10 @@ impl MdxFile {
 
     fn find(&mut self, key: String) -> Option<Record> {
         // find index
+        let mut key = key;
+        if self.dict_header.key_case_sensitive.to_lowercase() == "no" && key.contains(".") {
+            key = key.to_lowercase();
+        }
         let mut key_block_offset = 0;
         let key_block_info = self.key_index_section.index.iter().find(|k| {
             let b = k.first <= key && k.last >= key;
@@ -472,7 +479,7 @@ impl MdxFile {
                 } else {
                     String::from_utf8_lossy(key_buff).to_string()
                 };
-                if item == key {
+                if item.to_lowercase() == key {
                     // try read next record_offset;
                     pos += 1;
                     let next_record_offset = {
@@ -538,34 +545,34 @@ impl MdxFile {
         let block_offset = self.record_block_sect.record_block_offset + block_offset;
         self.file.seek(SeekFrom::Start(block_offset as u64)).expect("cannot seek");
         let flag = read_integer!(ByteOrder::LE, u32, self.file);
-        if flag == 2 {
-            // zip
-            let expect_adler32_checksum = read_integer!(ByteOrder::BE, u32, self.file);
-            let block_buff_size = record_block_index.compressed_size - 4/*flag*/ - 4/*checksum*/;
-            let mut block_buff: Vec<u8> = vec![0; block_buff_size as usize];
-            self.file.read_exact(&mut block_buff).expect("cannot read");
+        // zip
+        let expect_adler32_checksum = read_integer!(ByteOrder::BE, u32, self.file);
+        let block_buff_size = record_block_index.compressed_size - 4/*flag*/ - 4/*checksum*/;
+        let mut block_buff: Vec<u8> = vec![0; block_buff_size as usize];
+        self.file.read_exact(&mut block_buff).expect("cannot read");
 
+        if flag == 2 {
             let mut de = ZlibDecoder::new(block_buff.as_slice());
             let mut decompressed_buff: Vec<u8> = vec![];
             de.read_to_end(&mut decompressed_buff).expect("decompress fail");
-
-            let compute_adler32 = adler32::RollingAdler32::from_buffer(&decompressed_buff).hash();
-            if compute_adler32 != expect_adler32_checksum {
-                eprintln!("checksum does not match")
-            }
-
-            let relative_offset = (entry.record_offset - record_offset) as usize;
-            let data = if entry.data_size > 0 {
-                Vec::from(&decompressed_buff[relative_offset..relative_offset + entry.data_size as usize])
-            } else {
-                Vec::from(&decompressed_buff[relative_offset..])
-            };
-            return Some(Record {
-                key,
-                data,
-            });
+            block_buff = decompressed_buff
         }
-        None
+
+        let compute_adler32 = adler32::RollingAdler32::from_buffer(&block_buff).hash();
+        if compute_adler32 != expect_adler32_checksum {
+            eprintln!("checksum does not match")
+        }
+
+        let relative_offset = (entry.record_offset - record_offset) as usize;
+        let data = if entry.data_size > 0 {
+            Vec::from(&block_buff[relative_offset..relative_offset + entry.data_size as usize])
+        } else {
+            Vec::from(&block_buff[relative_offset..])
+        };
+        return Some(Record {
+            key,
+            data,
+        });
     }
 }
 
@@ -650,15 +657,21 @@ fn open_dict(p: &str) -> Dict {
 fn main() {
     env_logger::init();
 
-    //let mut dict = open_dict("dicts/oxford-v9");
-    let mut dict = open_dict("dicts/longman");
+    let args =  args().collect::<Vec<String>>();
+    if args.len() == 1 {
+        eprintln!("must provide word list");
+        process::abort();
+    }
+    let word_list = args.get(1).unwrap();
+
+    let mut dicts = vec![open_dict("dicts/oxford-v9"), open_dict("dicts/longman")];
 
     if !fs::metadata("out").is_ok() {
         fs::create_dir("out").expect("cannot create dir");
     }
 
     let mut flash_card_file = fs::File::create("flash-card.csv").expect("cannot create file");
-    let word_list = fs::File::open("word-list-1.txt").expect("cannot open word list");
+    let word_list = fs::File::open(word_list).expect("cannot open word list");
     let reader = std::io::BufReader::new(word_list);
     for line in reader.lines() {
         if line.is_err() {
@@ -667,68 +680,183 @@ fn main() {
 
         let input = line.unwrap().trim_end().to_string();
         info!("word: {}", input);
-        if let Some(word) = dict.find(input.clone()) {
-            let mut phon = String::new();
-
-
-
-            // search phonic
-            if let Some(r) = word.html.find(">NAmE<") {
-                let trimmed = &word.html[r..];
-                {
-                    // find phone
-                    let r1 = trimmed.find("<phon-blk>");
-                    let r2 = trimmed.find("</phon-blk>");
-                    if r1.is_some() && r2.is_some() {
-                        let r2 = r2.unwrap() + "</phon-blk>".len();
-                        phon.push_str(&trimmed[r1.unwrap()..r2]);
+        '_dict: for dict in dicts.as_mut_slice() {
+            if let Some(mut word) = dict.find(input.clone()) {
+                while word.html.starts_with("@@@LINK=") {
+                    let input = word.html.replace("@@@LINK=", "");
+                    let input = input.trim_end().to_string();
+                    if let Some(w) = dict.find(input) {
+                        word = w;
+                    } else {
+                        continue '_dict;
                     }
                 }
-                let sound = "<a href=\"sound://";
-                if let Some(sr) = trimmed.find(sound) {
-                    let trimmed = &trimmed[sr + sound.len()..];
-                    if let Some(r) = trimmed.find("\"") {
-                        let sound_file = "\\".to_string() + &trimmed[..r];
-                        if let Some(r) = dict.find_file(sound_file.as_str()) {
-                            let mp3_file = "out".to_string() + "/" + word.key.as_str() + ".mp3";
-                            let mut f = fs::File::create(mp3_file).expect("cannot create file");
-                            f.write_all(&r.data).expect("cannot write file");
+
+
+                let mut phon = String::new();
+
+                // search phonic
+                if let Some(r) = word.html.find(">NAmE<") {
+                    let trimmed = &word.html[r..];
+                    {
+                        // find phone
+                        let r1 = trimmed.find("<phon-blk>");
+                        let r2 = trimmed.find("</phon-blk>");
+                        if r1.is_some() && r2.is_some() {
+                            let r2 = r2.unwrap() + "</phon-blk>".len();
+                            phon.push_str(&trimmed[r1.unwrap()..r2]);
+                        }
+                    }
+                    let sound = "<a href=\"sound://";
+                    if let Some(sr) = trimmed.find(sound) {
+                        let trimmed = &trimmed[sr + sound.len()..];
+                        if let Some(r) = trimmed.find("\"") {
+                            let sound_file = "\\".to_string() + &trimmed[..r];
+                            if let Some(r) = dict.find_file(sound_file.as_str()) {
+                                let mp3_file = "out".to_string() + "/" + word.key.as_str() + ".mp3";
+                                let mut f = fs::File::create(mp3_file).expect("cannot create file");
+                                f.write_all(&r.data).expect("cannot write file");
+                            }
                         }
                     }
                 }
-            }
+                // search for longman
+                {
+                    //<span class="PRON">
+                    let phon_tag = "<span class=\"PRON\">";
+                    if let Some(r) = word.html.find(phon_tag) {
+                        let trimmed = &word.html[r + phon_tag.len()..];
+                        if let Some(r) = trimmed.find("</span>") {
+                            phon.push_str(&trimmed[..r])
+                        }
+                        // sound
+                        // sound://media/english/ameProns/laadhawkish.mp3
+                        let sound_tag = "sound://media/english/ameProns";
+                        if let Some(r) = trimmed.find(sound_tag) {
+                            let trimmed = &trimmed[r..];
+                            if let Some(r) = trimmed.find("\"") {
+                                let mp3_href = &trimmed[..r];
+                                if mp3_href.ends_with(".mp3") {
+                                    let mp3_href = String::from(mp3_href);
+                                    let mp3_href = mp3_href.replace("sound:/", "").replace("/", "\\");
 
-            if let Some(r) = dict.find_file("\\media\\english\\ameprons\\abracadabra.mp3"){
-                let mp3_file = "out".to_string() + "/" + word.key.as_str() + ".mp3";
-                let mut f = fs::File::create(mp3_file).expect("cannot create file");
-                f.write_all(&r.data).expect("cannot write file");
-            }
+                                    if let Some(r) = dict.find_file(mp3_href.as_str()) {
+                                        let mp3_file = "out".to_string() + "/" + word.key.as_str() + ".mp3";
 
-            // write flashcard file
-            {
-                flash_card_file.write_all(word.key.as_bytes()).expect("");
-                flash_card_file.write_all("|".as_bytes()).expect("");
-                flash_card_file.write_all(phon.as_bytes()).expect("");
-                flash_card_file.write_all("|".as_bytes()).expect("");
-                // example
-                flash_card_file.write_all("|".as_bytes()).expect("");
-
-                flash_card_file.write_all(r#"<html lang="en"><meta charset="UTF-8">"#.as_bytes()).expect("cannot write");
-
-                let mut html = word.html.replace("|", "/");
-                if html.as_bytes().len() >= 131072 {
-                    let s = &html.as_bytes()[..131072];
-                    html = String::from_utf8_lossy(s).to_string();
+                                        let mut f = fs::File::create(mp3_file).expect("cannot create file");
+                                        f.write_all(&r.data).expect("cannot write file");
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                let html = html.trim();
-                flash_card_file.write_all(html.as_bytes()).expect("cannot write");
 
-                flash_card_file.write_all("|".as_bytes()).expect("");
-                flash_card_file.write_all(("[sound:".to_string() + word.key.as_str() + ".mp3]").as_bytes()).expect("");
-                flash_card_file.write_all("\n".as_bytes()).expect("");
+                // save all mp3
+                {
+                    let mp3_start = "sound:/";
+                    let mut pos = 0;
+                    while let Some(r) = word.html[pos..].find(mp3_start) {
+                        let trimmed = &word.html[pos + r..];
+                        let mp3_end = ".mp3";
+                        if let Some(r2) = trimmed.find(mp3_end) {
+                            let raw_mp3_ref = trimmed[0..r2 + mp3_end.len()].to_owned();
+
+                            let mp3_key = raw_mp3_ref
+                                .replace(mp3_start, "")
+                                .replace("/", "\\");
+
+                            if mp3_key == "\\".to_string() + word.key.as_str() + ".mp3" {
+                                let mp3_key_html = mp3_key.clone().replace("\\", "_");
+                                word.html = word.html.replace(&raw_mp3_ref, &mp3_key_html);
+                                continue;
+                            }
+
+                            let mp3_key_html = mp3_key.clone().replace("\\", "_");
+
+                            let mp3_file = "out/".to_string() + mp3_key_html.as_str();
+                            if !fs::metadata(&mp3_file).is_ok() {
+                                // extract
+                                if let Some(r) = dict.find_file(mp3_key.as_str()) {
+                                    let mut f = fs::File::create(&mp3_file).expect("cannot create file");
+                                    f.write_all(&r.data).expect("cannot write file");
+                                    info!("mp3 file: {}", mp3_file);
+
+                                    // replace
+                                    word.html = word.html.replace(&raw_mp3_ref, &mp3_key_html);
+                                }
+                            }else {
+                                word.html = word.html.replace(&raw_mp3_ref, &mp3_key_html);
+                            }
+                        }
+                        pos += r + mp3_start.len();
+                    }
+                }
+                // search images
+                {
+                    // img src="thumb_house.png"
+                    let img_start = "img src=\"";
+                    let mut pos = 0;
+                    while let Some(r) = word.html[pos..].find(img_start) {
+                        let trimmed = &word.html[pos + r + img_start.len()..];
+                        let img_end = "\"";
+                        if let Some(r2) = trimmed.find(img_end) {
+                            let raw_img_ref = trimmed[0..r2].to_owned();
+                            if !raw_img_ref.ends_with(".png") && !raw_img_ref.ends_with(".jpg") && !raw_img_ref.ends_with(".svg") {
+                                pos += r + img_start.len();
+                                continue;
+                            }
+
+                            let img_key = "\\".to_string() + raw_img_ref.replace("/", "\\").as_str();
+
+                            let img_key_html = img_key.clone().replace("\\", "_");
+
+                            let img_file = "out/".to_string() + img_key_html.as_str();
+                            if !fs::metadata(&img_file).is_ok() {
+                                // extract
+                                if let Some(r) = dict.find_file(img_key.as_str()) {
+                                    let mut f = fs::File::create(&img_file).expect("cannot create file");
+                                    f.write_all(&r.data).expect("cannot write file");
+                                    info!("img file: {}", img_file);
+
+                                    // replace
+                                    word.html = word.html.replace(&raw_img_ref, &img_key_html);
+                                }
+                            } else {
+                                word.html = word.html.replace(&raw_img_ref, &img_key_html);
+                            }
+                        }
+                        pos += r + img_start.len();
+                    }
+                }
+
+                // write flashcard file
+                {
+                    flash_card_file.write_all(word.key.as_bytes()).expect("");
+                    flash_card_file.write_all("|".as_bytes()).expect("");
+                    flash_card_file.write_all(phon.as_bytes()).expect("");
+                    flash_card_file.write_all("|".as_bytes()).expect("");
+                    // example
+                    flash_card_file.write_all("|".as_bytes()).expect("");
+
+                    flash_card_file.write_all(r#"<html lang="en"><meta charset="UTF-8">"#.as_bytes()).expect("cannot write");
+
+                    let mut html = word.html.replace("|", "/");
+                    if html.as_bytes().len() >= 131072 {
+                        let s = &html.as_bytes()[..131072];
+                        html = String::from_utf8_lossy(s).to_string();
+                    }
+                    let html = html.trim();
+                    flash_card_file.write_all(html.as_bytes()).expect("cannot write");
+
+                    flash_card_file.write_all("|".as_bytes()).expect("");
+                    flash_card_file.write_all(("[sound:".to_string() + word.key.as_str() + ".mp3]").as_bytes()).expect("");
+                    flash_card_file.write_all("\n".as_bytes()).expect("");
+                }
+                break;
+            } else {
+                warn!("cannot find word: {}", input);
             }
-        } else {
-            warn!("cannot find word: {}", input);
         }
     }
 }
