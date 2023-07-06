@@ -6,12 +6,14 @@ use std::fmt::{Debug, Display, Formatter};
 use std::mem::size_of;
 use std::io::{Read, Write, Seek, SeekFrom, Cursor, BufRead};
 use std::path::Path;
-use log::{info, warn};
+use log::{debug, info, warn};
 use adler32;
 use serde::{Deserialize};
 use serde_xml_rs::{from_str};
 use flate2::read::ZlibDecoder;
 use crate::Encoding::Utf16;
+use base64;
+use base64::Engine;
 
 struct Error {
     msg: String,
@@ -189,6 +191,7 @@ struct MdxFile {
     encoding: Encoding,
     key_index_section: KeyIndexSection,
     record_block_sect: RecordBlockSection,
+    entries: Vec<Entry>,
 }
 
 impl MdxFile {
@@ -386,41 +389,24 @@ impl MdxFile {
             encoding,
             key_index_section,
             record_block_sect,
+            entries: vec![],
         })
     }
 
-    fn find(&mut self, key: String) -> Option<Record> {
+    fn load_entries(&mut self) -> Result<(), Error> {
         // find index
-        let mut key = key;
-        if self.dict_header.key_case_sensitive.to_lowercase() == "no" && key.contains(".") {
-            key = key.to_lowercase();
-        }
         let mut key_block_offset = 0;
-        let key_block_info = self.key_index_section.index.iter().find(|k| {
-            let b = k.first <= key && k.last >= key;
-            if !b {
-                key_block_offset += k.compressed_size
-            }
-            b
-        });
-        if key_block_info.is_none() {
-            return None;
-        }
-        let key_block_info = key_block_info.unwrap();
-
-        // read key block
-        let mut entry = None;
-        {
-            let key_block_offset = key_block_offset + self.key_index_section.key_block_data_offset;
-            self.file.seek(SeekFrom::Start(key_block_offset as u64)).expect("cannot seek");
+        for idx in &self.key_index_section.index {
+            let offset = key_block_offset + self.key_index_section.key_block_data_offset;
+            self.file.seek(SeekFrom::Start(offset as u64)).expect("cannot seek");
             let flag = read_integer!(ByteOrder::LE, i32, self.file);
             if flag != 2 {
                 warn!("not zlib compress");
-                return None;
+                return Err(Error::from("not zlib compress"));
             }
             let expect_adler32_checksum = read_integer!(ByteOrder::BE, u32, self.file);
 
-            let block_buff_size = key_block_info.compressed_size - 4 /*compress type*/ - 4 /* checksum*/;
+            let block_buff_size = idx.compressed_size - 4 /*compress type*/ - 4 /* checksum*/;
             let mut block_buff: Vec<u8> = vec![0; block_buff_size as usize];
             self.file.read_exact(&mut block_buff).expect("cannot read");
 
@@ -430,7 +416,8 @@ impl MdxFile {
 
             let compute_adler32 = adler32::RollingAdler32::from_buffer(&decompressed_buff).hash();
             if compute_adler32 != expect_adler32_checksum {
-                eprintln!("checksum does not match")
+                eprintln!("checksum does not match");
+                return Err(Error::from("checksum does not match"));
             }
 
             let mut pos = 0;
@@ -479,100 +466,288 @@ impl MdxFile {
                 } else {
                     String::from_utf8_lossy(key_buff).to_string()
                 };
-                if item.to_lowercase() == key {
-                    // try read next record_offset;
-                    pos += 1;
-                    let next_record_offset = {
-                        if self.ver == DictFormatVersion::V1 {
-                            if pos + 4 < decompressed_buff.len() {
-                                let mut buf: [u8; 4] = [0; 4];
-                                buf.clone_from_slice(&decompressed_buff[pos..pos + 4]);
-                                i32::from_be_bytes(buf) as i64
-                            } else {
-                                0
-                            }
-                        } else {
-                            if pos + 8 < decompressed_buff.len() {
-                                let mut buf: [u8; 8] = [0; 8];
-                                buf.clone_from_slice(&decompressed_buff[pos..pos + 8]);
-                                i64::from_be_bytes(buf)
-                            } else {
-                                0
-                            }
-                        }
-                    };
-                    let data_size = if next_record_offset > record_offset {
-                        next_record_offset - record_offset
-                    } else {
-                        0
-                    };
-                    entry = {
-                        Some(Entry {
-                            record_offset,
-                            data_size,
-                            key: item,
-                        })
-                    };
-                    break;
-                }
                 pos += 1;
+
+                // try read next record_offset;
+                let next_record_offset = {
+                    if self.ver == DictFormatVersion::V1 {
+                        if pos + 4 < decompressed_buff.len() {
+                            let mut buf: [u8; 4] = [0; 4];
+                            buf.clone_from_slice(&decompressed_buff[pos..pos + 4]);
+                            i32::from_be_bytes(buf) as i64
+                        } else {
+                            0
+                        }
+                    } else {
+                        if pos + 8 < decompressed_buff.len() {
+                            let mut buf: [u8; 8] = [0; 8];
+                            buf.clone_from_slice(&decompressed_buff[pos..pos + 8]);
+                            i64::from_be_bytes(buf)
+                        } else {
+                            0
+                        }
+                    }
+                };
+                let data_size = if next_record_offset > record_offset {
+                    next_record_offset - record_offset
+                } else {
+                    0
+                };
+                self.entries.push(Entry {
+                    record_offset,
+                    data_size,
+                    key: item,
+                })
             }
-        }
-        if entry.is_none() {
-            warn!("cannot find key: {}", key);
-            return None;
-        }
-        let entry = entry.unwrap();
-        info!("find key: record-offset: {}, key: {}", entry.record_offset, entry.key);
 
-        // find block
-        // read the  record block
-        let mut block_offset = 0;
-        let mut record_offset = 0;
-        let record_block_index = self.record_block_sect.index.iter().find(|k| {
-            let b = record_offset + k.decompressed_size > entry.record_offset;
-            if !b {
-                record_offset += k.decompressed_size;
-                block_offset += k.compressed_size;
+            key_block_offset += idx.compressed_size;
+        }
+        info!("entry count: {}", self.entries.len());
+        return Ok(());
+    }
+
+    fn find(&mut self, key: String, case_sensitive: bool) -> Option<Record> {
+        let entry = self.entries.iter().find(|k|
+            match case_sensitive {
+                true => k.key.eq(&key),
+                false => k.key.eq_ignore_ascii_case(&key),
             }
-            b
-        });
-        if record_block_index.is_none() {
-            return None;
-        }
-        let record_block_index = record_block_index.unwrap();
+        );
+        if let Some(entry) = entry {
+            // find block
+            // read the  record block
+            let mut block_offset = 0;
+            let mut record_offset = 0;
+            let record_block_index = self.record_block_sect.index.iter().find(|k| {
+                let b = record_offset + k.decompressed_size > entry.record_offset;
+                if !b {
+                    record_offset += k.decompressed_size;
+                    block_offset += k.compressed_size;
+                }
+                b
+            });
+            if record_block_index.is_none() {
+                return None;
+            }
+            let record_block_index = record_block_index.unwrap();
 
-        let block_offset = self.record_block_sect.record_block_offset + block_offset;
-        self.file.seek(SeekFrom::Start(block_offset as u64)).expect("cannot seek");
-        let flag = read_integer!(ByteOrder::LE, u32, self.file);
-        // zip
-        let expect_adler32_checksum = read_integer!(ByteOrder::BE, u32, self.file);
-        let block_buff_size = record_block_index.compressed_size - 4/*flag*/ - 4/*checksum*/;
-        let mut block_buff: Vec<u8> = vec![0; block_buff_size as usize];
-        self.file.read_exact(&mut block_buff).expect("cannot read");
+            let block_offset = self.record_block_sect.record_block_offset + block_offset;
+            self.file.seek(SeekFrom::Start(block_offset as u64)).expect("cannot seek");
+            let flag = read_integer!(ByteOrder::LE, u32, self.file);
+            // zip
+            let expect_adler32_checksum = read_integer!(ByteOrder::BE, u32, self.file);
+            let block_buff_size = record_block_index.compressed_size - 4/*flag*/ - 4/*checksum*/;
+            let mut block_buff: Vec<u8> = vec![0; block_buff_size as usize];
+            self.file.read_exact(&mut block_buff).expect("cannot read");
 
-        if flag == 2 {
-            let mut de = ZlibDecoder::new(block_buff.as_slice());
-            let mut decompressed_buff: Vec<u8> = vec![];
-            de.read_to_end(&mut decompressed_buff).expect("decompress fail");
-            block_buff = decompressed_buff
-        }
+            if flag == 2 {
+                let mut de = ZlibDecoder::new(block_buff.as_slice());
+                let mut decompressed_buff: Vec<u8> = vec![];
+                de.read_to_end(&mut decompressed_buff).expect("decompress fail");
+                block_buff = decompressed_buff
+            }
 
-        let compute_adler32 = adler32::RollingAdler32::from_buffer(&block_buff).hash();
-        if compute_adler32 != expect_adler32_checksum {
-            eprintln!("checksum does not match")
-        }
+            let compute_adler32 = adler32::RollingAdler32::from_buffer(&block_buff).hash();
+            if compute_adler32 != expect_adler32_checksum {
+                eprintln!("checksum does not match")
+            }
 
-        let relative_offset = (entry.record_offset - record_offset) as usize;
-        let data = if entry.data_size > 0 {
-            Vec::from(&block_buff[relative_offset..relative_offset + entry.data_size as usize])
+            let relative_offset = (entry.record_offset - record_offset) as usize;
+            let data = if entry.data_size > 0 {
+                Vec::from(&block_buff[relative_offset..relative_offset + entry.data_size as usize])
+            } else {
+                Vec::from(&block_buff[relative_offset..])
+            };
+            return Some(Record {
+                key,
+                data,
+            });
         } else {
-            Vec::from(&block_buff[relative_offset..])
-        };
-        return Some(Record {
-            key,
-            data,
-        });
+            return None;
+        }
+
+        //let mut key = key;
+        //if self.dict_header.key_case_sensitive.to_lowercase() == "no" && key.contains(".") {
+        //    key = key.to_lowercase();
+        //}
+        //let mut key_block_offset = 0;
+        //let key_block_info = self.key_index_section.index.iter().find(|k| {
+        //    let b = k.first <= key && k.last >= key;
+        //    if !b {
+        //        key_block_offset += k.compressed_size
+        //    }
+        //    b
+        //});
+        //if key_block_info.is_none() {
+        //    return None;
+        //}
+        //let key_block_info = key_block_info.unwrap();
+
+        //// read key block
+        //let mut entry = None;
+        //{
+        //    let key_block_offset = key_block_offset + self.key_index_section.key_block_data_offset;
+        //    self.file.seek(SeekFrom::Start(key_block_offset as u64)).expect("cannot seek");
+        //    let flag = read_integer!(ByteOrder::LE, i32, self.file);
+        //    if flag != 2 {
+        //        warn!("not zlib compress");
+        //        return None;
+        //    }
+        //    let expect_adler32_checksum = read_integer!(ByteOrder::BE, u32, self.file);
+
+        //    let block_buff_size = key_block_info.compressed_size - 4 /*compress type*/ - 4 /* checksum*/;
+        //    let mut block_buff: Vec<u8> = vec![0; block_buff_size as usize];
+        //    self.file.read_exact(&mut block_buff).expect("cannot read");
+
+        //    let mut de = ZlibDecoder::new(block_buff.as_slice());
+        //    let mut decompressed_buff: Vec<u8> = vec![];
+        //    de.read_to_end(&mut decompressed_buff).expect("decompress fail");
+
+        //    let compute_adler32 = adler32::RollingAdler32::from_buffer(&decompressed_buff).hash();
+        //    if compute_adler32 != expect_adler32_checksum {
+        //        eprintln!("checksum does not match")
+        //    }
+
+        //    let mut pos = 0;
+        //    while pos < decompressed_buff.len() {
+        //        if pos + 8 > decompressed_buff.len() {
+        //            break;
+        //        }
+
+        //        let record_offset = {
+        //            if self.ver == DictFormatVersion::V1 {
+        //                let mut buf: [u8; 4] = [0; 4];
+        //                buf.clone_from_slice(&decompressed_buff[pos..pos + 4]);
+        //                pos += 4;
+        //                i32::from_be_bytes(buf) as i64
+        //            } else {
+        //                let mut buf: [u8; 8] = [0; 8];
+        //                buf.clone_from_slice(&decompressed_buff[pos..pos + 8]);
+        //                pos += 8;
+        //                i64::from_be_bytes(buf)
+        //            }
+        //        };
+        //        let key_text_pos_start = pos;
+        //        while let Some(&b) = decompressed_buff.get(pos) {
+        //            if self.encoding == Utf16 {
+        //                pos += 1;
+        //                if let Some(&b1) = decompressed_buff.get(pos) {
+        //                    if b == 0 && b1 == 0 {
+        //                        break;
+        //                    }
+        //                } else {
+        //                    break;
+        //                }
+        //            } else if b == 0 {
+        //                break;
+        //            }
+        //            pos += 1;
+        //        }
+
+        //        let key_buff = &decompressed_buff[key_text_pos_start..pos];
+        //        let item = if self.encoding == Encoding::Utf16 {
+        //            let mut buff = key_buff.to_owned();
+        //            let utf16_buff = unsafe {
+        //                std::slice::from_raw_parts_mut(buff.as_mut_ptr().cast::<u16>(), buff.len() / 2)
+        //            };
+        //            String::from_utf16_lossy(utf16_buff)
+        //        } else {
+        //            String::from_utf8_lossy(key_buff).to_string()
+        //        };
+        //        if item.to_lowercase() == key {
+        //            // try read next record_offset;
+        //            pos += 1;
+        //            let next_record_offset = {
+        //                if self.ver == DictFormatVersion::V1 {
+        //                    if pos + 4 < decompressed_buff.len() {
+        //                        let mut buf: [u8; 4] = [0; 4];
+        //                        buf.clone_from_slice(&decompressed_buff[pos..pos + 4]);
+        //                        i32::from_be_bytes(buf) as i64
+        //                    } else {
+        //                        0
+        //                    }
+        //                } else {
+        //                    if pos + 8 < decompressed_buff.len() {
+        //                        let mut buf: [u8; 8] = [0; 8];
+        //                        buf.clone_from_slice(&decompressed_buff[pos..pos + 8]);
+        //                        i64::from_be_bytes(buf)
+        //                    } else {
+        //                        0
+        //                    }
+        //                }
+        //            };
+        //            let data_size = if next_record_offset > record_offset {
+        //                next_record_offset - record_offset
+        //            } else {
+        //                0
+        //            };
+        //            entry = {
+        //                Some(Entry {
+        //                    record_offset,
+        //                    data_size,
+        //                    key: item,
+        //                })
+        //            };
+        //            break;
+        //        }
+        //        pos += 1;
+        //    }
+        //}
+        //if entry.is_none() {
+        //    warn!("cannot find key: {}", key);
+        //    return None;
+        //}
+        //let entry = entry.unwrap();
+        //info!("find key: record-offset: {}, key: {}", entry.record_offset, entry.key);
+
+        //// find block
+        //// read the  record block
+        //let mut block_offset = 0;
+        //let mut record_offset = 0;
+        //let record_block_index = self.record_block_sect.index.iter().find(|k| {
+        //    let b = record_offset + k.decompressed_size > entry.record_offset;
+        //    if !b {
+        //        record_offset += k.decompressed_size;
+        //        block_offset += k.compressed_size;
+        //    }
+        //    b
+        //});
+        //if record_block_index.is_none() {
+        //    return None;
+        //}
+        //let record_block_index = record_block_index.unwrap();
+
+        //let block_offset = self.record_block_sect.record_block_offset + block_offset;
+        //self.file.seek(SeekFrom::Start(block_offset as u64)).expect("cannot seek");
+        //let flag = read_integer!(ByteOrder::LE, u32, self.file);
+        //// zip
+        //let expect_adler32_checksum = read_integer!(ByteOrder::BE, u32, self.file);
+        //let block_buff_size = record_block_index.compressed_size - 4/*flag*/ - 4/*checksum*/;
+        //let mut block_buff: Vec<u8> = vec![0; block_buff_size as usize];
+        //self.file.read_exact(&mut block_buff).expect("cannot read");
+
+        //if flag == 2 {
+        //    let mut de = ZlibDecoder::new(block_buff.as_slice());
+        //    let mut decompressed_buff: Vec<u8> = vec![];
+        //    de.read_to_end(&mut decompressed_buff).expect("decompress fail");
+        //    block_buff = decompressed_buff
+        //}
+
+        //let compute_adler32 = adler32::RollingAdler32::from_buffer(&block_buff).hash();
+        //if compute_adler32 != expect_adler32_checksum {
+        //    eprintln!("checksum does not match")
+        //}
+
+        //let relative_offset = (entry.record_offset - record_offset) as usize;
+        //let data = if entry.data_size > 0 {
+        //    Vec::from(&block_buff[relative_offset..relative_offset + entry.data_size as usize])
+        //} else {
+        //    Vec::from(&block_buff[relative_offset..])
+        //};
+        //return Some(Record {
+        //    key,
+        //    data,
+        //});
     }
 }
 
@@ -592,8 +767,8 @@ pub struct Dict {
 }
 
 impl Dict {
-    pub fn find(&mut self, word: String) -> Option<Word> {
-        let mut record = self.mdx.find(word.clone())?;
+    pub fn find(&mut self, word: String, case_sensitive: bool) -> Option<Word> {
+        let mut record = self.mdx.find(word.clone(), case_sensitive)?;
         if self.mdx.encoding == Utf16 {
             if record.data.len() >= 2 &&
                 record.data[record.data.len() - 1] == 0 &&
@@ -612,7 +787,7 @@ impl Dict {
 
     pub fn find_file(&mut self, word: &str) -> Option<Record> {
         for mdd in &mut self.mdd {
-            let record = mdd.find(word.to_string());
+            let record = mdd.find(word.to_string(), false);
             if record.is_some() {
                 return record;
             }
@@ -633,17 +808,22 @@ fn open_dict(p: &str) -> Dict {
         info!("processing: {}", file);
         if file.ends_with(".mdx") {
             match MdxFile::parse(file) {
-                Ok(f) => mdx_file = Some(f),
+                Ok(mut f) =>
+                    match f.load_entries() {
+                        Ok(_) => mdx_file = Some(f),
+                        Err(e) => panic!("cannot open mdx file: {}", e),
+                    }
                 Err(e) => panic!("cannot open mdx file: {}", e),
             }
         } else if file.ends_with(".mdd") {
-            let mdx_file = MdxFile::parse(item.as_path());
-            if mdx_file.is_err() {
-                let e = mdx_file.err().unwrap();
-                panic!("cannot open {}: {}", file, e)
+            match MdxFile::parse(item.as_path()) {
+                Ok(mut f) =>
+                    match f.load_entries() {
+                        Ok(_) => mdd.push(f),
+                        Err(e) => panic!("cannot open mdx file: {}", e),
+                    }
+                Err(e) => panic!("cannot open mdx file: {}", e),
             }
-            let mdx_file = mdx_file.unwrap();
-            mdd.push(mdx_file);
         }
     }
     let mdx_file = mdx_file.expect("no mdx file found");
@@ -657,14 +837,16 @@ fn open_dict(p: &str) -> Dict {
 fn main() {
     env_logger::init();
 
-    let args =  args().collect::<Vec<String>>();
+    let args = args().collect::<Vec<String>>();
     if args.len() == 1 {
         eprintln!("must provide word list");
         process::abort();
     }
     let word_list = args.get(1).unwrap();
 
-    let mut dicts = vec![open_dict("dicts/oxford-v9"), open_dict("dicts/longman")];
+    let mut dicts = vec![
+        open_dict("assets/dicts/oxford-v9"),
+        open_dict("assets/dicts/longman")];
 
     if !fs::metadata("out").is_ok() {
         fs::create_dir("out").expect("cannot create dir");
@@ -681,11 +863,15 @@ fn main() {
         let input = line.unwrap().trim_end().to_string();
         info!("word: {}", input);
         '_dict: for dict in dicts.as_mut_slice() {
-            if let Some(mut word) = dict.find(input.clone()) {
-                while word.html.starts_with("@@@LINK=") {
+            let mut case_sensitive = dict.mdx.dict_header.key_case_sensitive.to_lowercase() == "no";
+            if let Some(mut word) = dict.find(input.clone(), case_sensitive) {
+                let mut redirect = 0;
+                while word.html.starts_with("@@@LINK=") && redirect < 30 {
+                    redirect += 1;
                     let input = word.html.replace("@@@LINK=", "");
                     let input = input.trim_end().to_string();
-                    if let Some(w) = dict.find(input) {
+                    case_sensitive = true;
+                    if let Some(w) = dict.find(input, case_sensitive) {
                         word = w;
                     } else {
                         continue '_dict;
@@ -780,12 +966,12 @@ fn main() {
                                 if let Some(r) = dict.find_file(mp3_key.as_str()) {
                                     let mut f = fs::File::create(&mp3_file).expect("cannot create file");
                                     f.write_all(&r.data).expect("cannot write file");
-                                    info!("mp3 file: {}", mp3_file);
+                                    debug!("mp3 file: {}", mp3_file);
 
                                     // replace
                                     word.html = word.html.replace(&raw_mp3_ref, &mp3_key_html);
                                 }
-                            }else {
+                            } else {
                                 word.html = word.html.replace(&raw_mp3_ref, &mp3_key_html);
                             }
                         }
@@ -793,6 +979,7 @@ fn main() {
                     }
                 }
                 // search images
+                let mut img_count = 0;
                 {
                     // img src="thumb_house.png"
                     let img_start = "img src=\"";
@@ -802,7 +989,31 @@ fn main() {
                         let img_end = "\"";
                         if let Some(r2) = trimmed.find(img_end) {
                             let raw_img_ref = trimmed[0..r2].to_owned();
-                            if !raw_img_ref.ends_with(".png") && !raw_img_ref.ends_with(".jpg") && !raw_img_ref.ends_with(".svg") {
+                            // img is base64
+                            let base64_jpg_prefix = "data:image/jpeg;base64,";
+                            if raw_img_ref.starts_with(base64_jpg_prefix) {
+                                // decode and write to a file
+                                let encoded_jpg_data = raw_img_ref[base64_jpg_prefix.len()..r2].to_owned();
+                                let img_name = "_base64_".to_string()
+                                    + img_count.to_string().as_str()
+                                    + word.key.as_str() + ".jpg";
+                                let img_file = "out/".to_string() + img_name.as_str();
+                                if !fs::metadata(&img_file).is_ok() {
+                                    let jpg_data = base64::engine::general_purpose::STANDARD.
+                                        decode(encoded_jpg_data).expect("cannot decode");
+                                    let mut f = fs::File::create(&img_file).expect("cannot create file");
+                                    f.write_all(&jpg_data).expect("cannot write file");
+                                    debug!("img file: {}", img_file);
+                                }
+                                // replace
+                                word.html = word.html.replace(&raw_img_ref, &img_name);
+                                img_count += 1;
+                                pos += base64_jpg_prefix.len();
+                                continue;
+                            }
+                            if !raw_img_ref.ends_with(".png") &&
+                                !raw_img_ref.ends_with(".jpg") &&
+                                !raw_img_ref.ends_with(".svg") {
                                 pos += r + img_start.len();
                                 continue;
                             }
@@ -817,7 +1028,7 @@ fn main() {
                                 if let Some(r) = dict.find_file(img_key.as_str()) {
                                     let mut f = fs::File::create(&img_file).expect("cannot create file");
                                     f.write_all(&r.data).expect("cannot write file");
-                                    info!("img file: {}", img_file);
+                                    debug!("img file: {}", img_file);
 
                                     // replace
                                     word.html = word.html.replace(&raw_img_ref, &img_key_html);
@@ -825,6 +1036,38 @@ fn main() {
                             } else {
                                 word.html = word.html.replace(&raw_img_ref, &img_key_html);
                             }
+                        }
+                        pos += r + img_start.len();
+                    }
+                }
+                // search base64 images
+                {
+                    // <img xxxxx src="data:image/jpeg;base64,"
+                    let img_start = "src=\"data:image/jpeg;base64,";
+                    let mut pos = 0;
+                    while let Some(r) = word.html[pos..].find(img_start) {
+                        let trimmed = &word.html[pos + r + img_start.len()..];
+                        let img_end = "\"";
+                        if let Some(r2) = trimmed.find(img_end) {
+                            let raw_img_ref = trimmed[0..r2].to_owned();
+                            let img_name = "_base64_".to_string()
+                                + img_count.to_string().as_str()
+                                + word.key.as_str() + ".jpg";
+                            let img_file = "out/_base64_".to_string() + img_name.as_str();
+                            if !fs::metadata(&img_file).is_ok() {
+                                let jpg_data = base64::engine::general_purpose::STANDARD.
+                                    decode(&raw_img_ref).expect("cannot decode");
+                                let mut f = fs::File::create(&img_file).expect("cannot create file");
+                                f.write_all(&jpg_data).expect("cannot write file");
+                                debug!("img file: {}", img_file);
+                            }
+                            // replace
+                            let old_str = img_start.to_owned() + raw_img_ref.as_str();
+                            let new_str = "src=\"".to_owned() + img_name.as_str();
+                            word.html = word.html.replace(&old_str, &new_str);
+                            img_count += 1;
+                            pos += r + img_start.len();
+                            continue;
                         }
                         pos += r + img_start.len();
                     }
